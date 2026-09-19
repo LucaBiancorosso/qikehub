@@ -43,7 +43,7 @@ The port is not the security boundary — certificate-only IKEv2 with strict pro
 ## Quick start
 
 ```bash
-git clone https://github.com/<you>/qikehub && cd qikehub
+git clone https://github.com/LucaBiancorosso/qikehub && cd qikehub
 sudo ./qikehub install          # interactive; installs itself to /opt/qikehub
 sudo qikehub add-client luca-iphone
 sudo qikehub add-client luca-mac
