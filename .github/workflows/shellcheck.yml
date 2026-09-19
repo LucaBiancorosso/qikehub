@@ -1,0 +1,15 @@
+name: shellcheck
+on:
+  push:
+  pull_request:
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Syntax check
+        run: bash -n ipsec-hub && for f in lib/*.sh; do bash -n "$f"; done
+      - name: shellcheck
+        run: shellcheck ipsec-hub lib/*.sh

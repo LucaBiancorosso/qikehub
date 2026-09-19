@@ -1,0 +1,3 @@
+# libs share globals across files (state keys, render outputs)
+disable=SC2034,SC2153
+shell=bash

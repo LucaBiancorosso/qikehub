@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# ipsec-hub — IKEv2/IPsec full-tunnel hub for a small VPS (Debian 13).
+# https://github.com/<you>/ipsec-hub — SPDX-License-Identifier: MIT
+set -Eeuo pipefail
+umask 022
+
+HUB_VERSION="0.1.0"
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+HUB_SRC=$(dirname "$SELF")
+
+for _lib in common net pki strongswan firewall monitoring system profiles; do
+  # shellcheck source=/dev/null
+  . "$HUB_SRC/lib/$_lib.sh"
+done
+unset _lib
+
+on_err() { printf '%s[x]%s failed (rc=%s) at line %s: %s\n' "$C_R" "$C_0" "$1" "$2" "$3" >&2; }
+trap 'on_err $? $LINENO "$BASH_COMMAND"' ERR
+
+usage() {
+  cat <<EOF
+ipsec-hub $HUB_VERSION — IKEv2/IPsec full-tunnel hub
+
+Usage: ipsec-hub <command> [args]
+
+  install | configure     interactive setup (re-run to change settings)
+  render                  re-apply all generated config from $HUB_CONF
+  add-client NAME         issue a device identity + Apple/Android/swanctl profiles
+  revoke-client NAME      revoke via CRL and drop live SAs
+  list-clients            issued identities
+  site-config             (re)issue home-site identity + RouterOS script
+  status                  services, SAs, pools, metrics
+  lockdown [--force]      remove public SSH bootstrap (run over the tunnel)
+  allow-ssh CIDR[,CIDR]   re-open public SSH for given sources
+  snmp-rotate             new SNMPv3 credentials
+  version | help
+
+Non-interactive: HUB_NONINTERACTIVE=1 with settings pre-set as env vars
+(see examples/hub.env.example).
+EOF
+}
+
+install_self() {
+  if [[ $HUB_SRC != "$HUB_OPT" ]]; then
+    install -d -m 0755 "$HUB_OPT/lib"
+    install -m 0755 "$HUB_SRC/ipsec-hub" "$HUB_OPT/ipsec-hub"
+    install -m 0644 "$HUB_SRC"/lib/*.sh "$HUB_OPT/lib/"
+  fi
+  ln -sfn "$HUB_OPT/ipsec-hub" /usr/local/sbin/ipsec-hub
+}
+
+render_all() {
+  net_apply
+  pki_init
+  pki_ensure_server
+  swan_apply
+  conf_save            # PQ_ACTIVE may have changed
+  fw_apply
+  mon_apply
+  if [[ $HARDEN_SSH == yes ]]; then harden_ssh; fi
+  if [[ $AUTO_UPDATES == yes ]]; then auto_updates; fi
+}
+
+summary() {
+  cat <<EOF
+
+  FQDN / public IP   $HUB_FQDN / $PUBLIC_IP4 ($WAN_IF)
+  Public ports       UDP/$IKE_PORT$([[ $PORT_MODE == hybrid ]] && echo " + UDP/500, UDP/4500 (Apple native)")
+  Client pool        $POOL4, $POOL6 (IPv6: $IPV6_MODE)
+  Management         $MGMT4 (SSH$([[ $SNMP_ENABLED == yes ]] && echo ", SNMPv3")$([[ $NODE_EXPORTER == yes ]] && echo ", :9100")) — tunnel only
+  Client crypto      AES-256-GCM, SHA-384, ECP-384$([[ $PQ_MODE != off ]] && echo " + ML-KEM-1024 ($PQ_MODE)"), ECDSA P-384 certs
+  Egress             $EGRESS
+  Home site          $HOME_ENABLED$([[ $HOME_ENABLED == yes ]] && echo " — $HOME_NAME, LANs $HOME_LANS, auth $HOME_AUTH")
+  Client DNS         $CLIENT_DNS
+  SSH bootstrap      ${SSH_BOOTSTRAP:-none}
+EOF
+}
+
+cmd_install() {
+  require_root
+  hdr "ipsec-hub $HUB_VERSION"
+  preflight
+
+  # env presets win over stored state
+  local -A preset=()
+  local k
+  for k in "${HUB_KEYS[@]}"; do
+    if [[ -n ${!k-} ]]; then preset[$k]=${!k}; fi
+  done
+  conf_load || true
+  for k in "${!preset[@]}"; do printf -v "$k" '%s' "${preset[$k]}"; done
+
+  hdr "Reachability"
+  ask WAN_IF "WAN interface" "$(detect_wan_if)" is_ifname
+  ask PUBLIC_IP4 "Public IPv4" "$(detect_public_ip4 "$WAN_IF")" is_ipv4
+  ask HUB_FQDN "Hub FQDN (A record → $PUBLIC_IP4)" "" is_fqdn
+  check_dns
+  ID_DOMAIN=${ID_DOMAIN:-$HUB_FQDN}
+
+  hdr "Ports"
+  cat <<'EOF'
+  custom : ONE non-standard UDP port. Works for strongSwan-based initiators
+           (Android app, Linux, macOS+Homebrew, RouterOS — verify, see README).
+  hybrid : custom port + UDP/500 (+4500 redirected). REQUIRED for the native
+           iOS/iPadOS/macOS IKEv2 client — Apple exposes no remote-port setting.
+EOF
+  ask_choice PORT_MODE "Port mode" hybrid "custom hybrid"
+  ask IKE_PORT "Published UDP port" "$(rand_port)" is_port
+
+  hdr "Addressing"
+  ask OVERLAY4 "Overlay /23 (1st /24 = clients, 2nd = mgmt)" 10.99.0.0/23 is_overlay23
+  derive_overlay
+  POOL6=${POOL6:-$(gen_ula_pool6)}
+  if has_global_ip6 "$WAN_IF"; then
+    ask_choice IPV6_MODE "Client IPv6: reject (leak-proof) or NAT66 via VPS" block "block nat66"
+  else
+    IPV6_MODE=block
+    log "no global IPv6 on $WAN_IF → client IPv6 captured and rejected"
+  fi
+
+  hdr "Crypto"
+  ask_choice PQ_MODE "Hybrid PQ key exchange for clients (ECP-384 + ML-KEM-1024)" require "require prefer off"
+
+  hdr "Home site & egress"
+  ask_choice EGRESS "Client internet egress" vps "vps home"
+  if [[ $EGRESS == home ]]; then
+    HOME_ENABLED=yes
+  else
+    ask_choice HOME_ENABLED "Home site (initiates to the hub, e.g. RouterOS behind CGNAT)" yes "yes no"
+  fi
+  local def_dns="9.9.9.9,149.112.112.112"
+  if [[ $HOME_ENABLED == yes ]]; then
+    ask HOME_NAME "Site name" home-gw is_name
+    ask HOME_LANS "Home LAN prefixes (comma separated)" 192.168.10.0/24 is_cidr4_list
+    local lan
+    for lan in ${HOME_LANS//,/ }; do
+      if cidr4_overlap "$lan" "$OVERLAY4"; then die "$lan overlaps overlay $OVERLAY4"; fi
+    done
+    ask_choice HOME_AUTH "Site authentication" cert "cert psk"
+    if [[ $EGRESS == home ]]; then
+      local first=${HOME_LANS%%,*}; def_dns=$(int2ip $(( $(ip2int "${first%/*}") + 1 )))
+    fi
+  else
+    HOME_LANS="" HOME_NAME=${HOME_NAME:-home-gw} HOME_AUTH=${HOME_AUTH:-cert}
+  fi
+  ask CLIENT_DNS "DNS pushed to clients" "$def_dns" is_ipv4_list
+  ask_choice APPLE_ONDEMAND "Apple profiles always-on (OnDemand + IncludeAllNetworks, fail-closed)" yes "yes no"
+
+  hdr "Management"
+  local boot="" boot_dst=""
+  if [[ -n ${SSH_CONNECTION-} ]]; then
+    boot_dst=$(awk '{print $3}' <<<"$SSH_CONNECTION")
+    # only seed a default if we're actually on the public WAN address — a session
+    # over the mgmt tunnel must never auto-suggest reopening public SSH (that's
+    # what 'ipsec-hub lockdown' closed)
+    if [[ $boot_dst == "$PUBLIC_IP4" ]]; then
+      boot=${SSH_CONNECTION%% *}
+      if [[ $boot == *:* ]]; then boot="$boot/128"; else boot="$boot/32"; fi
+    fi
+  fi
+  ask SSH_BOOTSTRAP "Temporary public SSH sources ('-' = none)" "$boot" is_src_list
+  ask_choice SNMP_ENABLED "SNMPv3 agent on $MGMT4" yes "yes no"
+  if [[ $SNMP_ENABLED == yes ]]; then ask SNMP_USER "SNMPv3 user" monitor is_name; fi
+  ask_choice NODE_EXPORTER "Prometheus node_exporter + IPsec metrics on $MGMT4:9100" yes "yes no"
+  ask_choice HARDEN_SSH "Harden sshd (key-only)" yes "yes no"
+  ask_choice AUTO_UPDATES "Unattended security upgrades" yes "yes no"
+  PQ_ACTIVE=${PQ_ACTIVE:-off}
+
+  hdr "Summary"
+  summary
+  confirm "apply?" || die "aborted, nothing changed"
+
+  conf_save
+  install_self
+  install_packages
+  render_all
+
+  hdr "Done"
+  cat <<EOF
+  Next:
+    ipsec-hub add-client luca-iphone      # → $HUB_OUT/luca-iphone/
+$([[ $HOME_ENABLED == yes ]] && echo "    ipsec-hub site-config                 # → RouterOS script + identity")
+    ssh <user>@$MGMT4                    # over the tunnel, then:
+    ipsec-hub lockdown                    # closes public SSH
+  Provider firewall: allow only UDP/$IKE_PORT$([[ $PORT_MODE == hybrid ]] && echo ", UDP/500, UDP/4500") (+ TCP/22 until lockdown).
+EOF
+}
+
+cmd_render() { require_root; conf_load || die "not installed"; render_all; }
+
+cmd_add_client() {
+  require_root; conf_load || die "not installed"
+  local name=${1-}
+  if [[ -z $name ]]; then ask name "Client name (e.g. luca-iphone)" "" is_name; fi
+  is_name "$name" || die "invalid name '$name' (a-z0-9-, 2-32 chars)"
+  [[ -z $(pki_index_valid client "$name") ]] || die "client '$name' already exists — revoke it first"
+
+  local id="$name@$ID_DOMAIN" dir="$HUB_OUT/$name" pass
+  install -d -m 0700 "$HUB_VAR" "$HUB_OUT"
+  rm -rf "$dir"; install -d -m 0700 "$dir"
+
+  pki_issue_entity client "$name" "$id"
+  pass=$(gen_secret 24)
+  export HUB_P12_PASS=$pass
+  pki_export_p12 "$PKI_KEY" "$PKI_CERT" "$id" "$dir/$name.p12"
+  unset HUB_P12_PASS
+  pki_destroy_key "$PKI_KEY"
+
+  install -m 0644 "$HUB_PKI/certs/ca.pem" "$dir/ipsec-hub-ca.pem"
+  install -m 0644 "$PKI_CERT" "$dir/$name.pem"
+  profile_apple "$name" "$id" "$dir/$name.p12" > "$dir/$name.mobileconfig"
+  profile_sswan "$name" "$id" "$dir/$name.p12" > "$dir/$name.sswan"
+  profile_swanctl "$name" "$id" > "$dir/$name-swanctl.conf"
+  chmod 0600 "$dir"/*
+
+  hdr "Client $name"
+  cat <<EOF
+  Identity        $id
+  PKCS#12 pass    ${C_B}$pass${C_0}   (shown once — not stored)
+  Files           $dir/
+    $name.mobileconfig   iOS/iPadOS/macOS native$([[ $PORT_MODE == custom ]] && echo "  ${C_Y}(needs PORT_MODE=hybrid)${C_0}")
+    $name.sswan          strongSwan Android app (custom port)
+    $name-swanctl.conf   Linux / macOS Homebrew strongSwan (custom port)
+    $name.p12, $name.pem, ipsec-hub-ca.pem
+  Copy off the box (e.g. scp root@$MGMT4:$dir/$name.mobileconfig .), install,
+  then: rm -rf $dir
+EOF
+}
+
+cmd_revoke_client() {
+  require_root; conf_load || die "not installed"
+  local name=${1-} id
+  is_name "$name" || die "usage: ipsec-hub revoke-client NAME"
+  id=$(pki_revoke_entity client "$name" key-compromise) || die "no valid client '$name'"
+  swan_install_creds
+  swan_load
+  swan_terminate_id "$id"
+  rm -rf "${HUB_OUT:?}/$name"
+  log "revoked $id (CRL updated, SAs terminated)"
+}
+
+cmd_list_clients() {
+  require_root; conf_load || die "not installed"
+  printf '%-8s %-20s %-40s %-26s %s\n' TYPE NAME ID NOT_AFTER STATUS
+  awk -F'\t' '{printf "%-8s %-20s %-40s %-26s %s\n", $1, $2, $3, $5, $6}' "$HUB_PKI/index.tsv"
+}
+
+cmd_site_config() {
+  require_root; conf_load || die "not installed"
+  [[ $HOME_ENABLED == yes ]] || die "home site disabled — run 'ipsec-hub configure'"
+  local dir="$HUB_OUT/site-$HOME_NAME" id pass=""
+  id=$(site_id)
+  rm -rf "$dir"; install -d -m 0700 "$HUB_OUT" "$dir"
+  if [[ $HOME_AUTH == cert ]]; then
+    if [[ -n $(pki_index_valid site "$HOME_NAME") ]]; then
+      pki_revoke_entity site "$HOME_NAME" superseded >/dev/null
+      swan_install_creds; swan_load; swan_terminate_id "$id"
+    fi
+    pki_issue_entity site "$HOME_NAME" "$id"
+    pass=$(gen_secret 24)
+    export HUB_P12_PASS=$pass
+    pki_export_p12 "$PKI_KEY" "$PKI_CERT" "$id" "$dir/$HOME_NAME.p12"
+    unset HUB_P12_PASS
+    pki_destroy_key "$PKI_KEY"
+    install -m 0600 "$HUB_PKI/certs/ca.pem" "$dir/ipsec-hub-ca.pem"
+  fi
+  profile_routeros > "$dir/$HOME_NAME.rsc"
+  chmod 0600 "$dir"/*
+  hdr "Site $HOME_NAME"
+  cat <<EOF
+  Identity        fqdn:$id → hub fqdn:$HUB_FQDN, UDP/$IKE_PORT
+$([[ -n $pass ]] && echo "  PKCS#12 pass    ${C_B}$pass${C_0}   (shown once)")
+  Files           $dir/
+  RouterOS script $HOME_NAME.rsc  (read the header before importing)
+EOF
+}
+
+cmd_status() {
+  require_root; conf_load || die "not installed"
+  hdr "Services"
+  local u
+  for u in ipsec-hub-net "$SWAN_UNIT" nftables ipsec-hub-metrics.timer snmpd prometheus-node-exporter; do
+    printf '  %-28s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null || true)"
+  done
+  hdr "Tunnels"
+  "$HUB_LIBEXEC/collect-metrics.sh" || true
+  for u in "${MON_KEYS[@]}"; do printf '  %-18s %s\n' "$u" "$(cat "/run/ipsec-hub/snmp/$u" 2>/dev/null || echo U)"; done
+  hdr "SAs"
+  swanctl --list-sas 2>/dev/null | sed 's/^/  /' || true
+  hdr "Config"
+  summary
+}
+
+cmd_lockdown() {
+  require_root; conf_load || die "not installed"
+  if [[ -n ${SSH_CONNECTION-} && ${1-} != --force ]]; then
+    local dst; dst=$(awk '{print $3}' <<<"$SSH_CONNECTION")
+    [[ $dst == "$MGMT4" ]] || die "you are on $dst, not $MGMT4 — reconnect over the tunnel (or --force)"
+  fi
+  SSH_BOOTSTRAP=""
+  conf_save
+  fw_apply
+  log "public SSH closed; management only via $MGMT4"
+}
+
+cmd_allow_ssh() {
+  require_root; conf_load || die "not installed"
+  if [[ -z ${1-} ]] || ! is_src_list "$1"; then die "usage: ipsec-hub allow-ssh CIDR[,CIDR]"; fi
+  SSH_BOOTSTRAP=$1
+  conf_save
+  fw_apply
+}
+
+cmd_snmp_rotate() {
+  require_root; conf_load || die "not installed"
+  [[ $SNMP_ENABLED == yes ]] || die "SNMP disabled"
+  snmp_create_user
+  systemctl start snmpd.service
+  cat "$HUB_SECRETS/snmp.env"
+}
+
+main() {
+  local cmd=${1:-help}
+  shift || true
+  case $cmd in
+    install|configure) cmd_install "$@" ;;
+    render)            cmd_render ;;
+    add-client)        cmd_add_client "$@" ;;
+    revoke-client)     cmd_revoke_client "$@" ;;
+    list-clients)      cmd_list_clients ;;
+    site-config)       cmd_site_config ;;
+    status)            cmd_status ;;
+    lockdown)          cmd_lockdown "$@" ;;
+    allow-ssh)         cmd_allow_ssh "$@" ;;
+    snmp-rotate)       cmd_snmp_rotate ;;
+    version)           echo "$HUB_VERSION" ;;
+    help|-h|--help)    usage ;;
+    *)                 usage; exit 2 ;;
+  esac
+}
+
+main "$@"
