@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# ipsec-hub — IKEv2/IPsec full-tunnel hub for a small VPS (Debian 13).
-# https://github.com/<you>/ipsec-hub — SPDX-License-Identifier: MIT
+# qikehub — IKEv2/IPsec full-tunnel hub for a small VPS (Debian 13).
+# https://github.com/<you>/qikehub — SPDX-License-Identifier: MIT
 set -Eeuo pipefail
 umask 022
 
@@ -19,9 +19,9 @@ trap 'on_err $? $LINENO "$BASH_COMMAND"' ERR
 
 usage() {
   cat <<EOF
-ipsec-hub $HUB_VERSION — IKEv2/IPsec full-tunnel hub
+qikehub $HUB_VERSION — IKEv2/IPsec full-tunnel hub
 
-Usage: ipsec-hub <command> [args]
+Usage: qikehub <command> [args]
 
   install | configure     interactive setup (re-run to change settings)
   render                  re-apply all generated config from $HUB_CONF
@@ -43,10 +43,10 @@ EOF
 install_self() {
   if [[ $HUB_SRC != "$HUB_OPT" ]]; then
     install -d -m 0755 "$HUB_OPT/lib"
-    install -m 0755 "$HUB_SRC/ipsec-hub" "$HUB_OPT/ipsec-hub"
+    install -m 0755 "$HUB_SRC/qikehub" "$HUB_OPT/qikehub"
     install -m 0644 "$HUB_SRC"/lib/*.sh "$HUB_OPT/lib/"
   fi
-  ln -sfn "$HUB_OPT/ipsec-hub" /usr/local/sbin/ipsec-hub
+  ln -sfn "$HUB_OPT/qikehub" /usr/local/sbin/qikehub
 }
 
 render_all() {
@@ -78,7 +78,7 @@ EOF
 
 cmd_install() {
   require_root
-  hdr "ipsec-hub $HUB_VERSION"
+  hdr "qikehub $HUB_VERSION"
   preflight
 
   # env presets win over stored state
@@ -152,7 +152,7 @@ EOF
     boot_dst=$(awk '{print $3}' <<<"$SSH_CONNECTION")
     # only seed a default if we're actually on the public WAN address — a session
     # over the mgmt tunnel must never auto-suggest reopening public SSH (that's
-    # what 'ipsec-hub lockdown' closed)
+    # what 'qikehub lockdown' closed)
     if [[ $boot_dst == "$PUBLIC_IP4" ]]; then
       boot=${SSH_CONNECTION%% *}
       if [[ $boot == *:* ]]; then boot="$boot/128"; else boot="$boot/32"; fi
@@ -178,10 +178,10 @@ EOF
   hdr "Done"
   cat <<EOF
   Next:
-    ipsec-hub add-client luca-iphone      # → $HUB_OUT/luca-iphone/
-$([[ $HOME_ENABLED == yes ]] && echo "    ipsec-hub site-config                 # → RouterOS script + identity")
+    qikehub add-client luca-iphone      # → $HUB_OUT/luca-iphone/
+$([[ $HOME_ENABLED == yes ]] && echo "    qikehub site-config                 # → RouterOS script + identity")
     ssh <user>@$MGMT4                    # over the tunnel, then:
-    ipsec-hub lockdown                    # closes public SSH
+    qikehub lockdown                    # closes public SSH
   Provider firewall: allow only UDP/$IKE_PORT$([[ $PORT_MODE == hybrid ]] && echo ", UDP/500, UDP/4500") (+ TCP/22 until lockdown).
 EOF
 }
@@ -206,7 +206,7 @@ cmd_add_client() {
   unset HUB_P12_PASS
   pki_destroy_key "$PKI_KEY"
 
-  install -m 0644 "$HUB_PKI/certs/ca.pem" "$dir/ipsec-hub-ca.pem"
+  install -m 0644 "$HUB_PKI/certs/ca.pem" "$dir/qikehub-ca.pem"
   install -m 0644 "$PKI_CERT" "$dir/$name.pem"
   profile_apple "$name" "$id" "$dir/$name.p12" > "$dir/$name.mobileconfig"
   profile_sswan "$name" "$id" "$dir/$name.p12" > "$dir/$name.sswan"
@@ -221,7 +221,7 @@ cmd_add_client() {
     $name.mobileconfig   iOS/iPadOS/macOS native$([[ $PORT_MODE == custom ]] && echo "  ${C_Y}(needs PORT_MODE=hybrid)${C_0}")
     $name.sswan          strongSwan Android app (custom port)
     $name-swanctl.conf   Linux / macOS Homebrew strongSwan (custom port)
-    $name.p12, $name.pem, ipsec-hub-ca.pem
+    $name.p12, $name.pem, qikehub-ca.pem
   Copy off the box (e.g. scp root@$MGMT4:$dir/$name.mobileconfig .), install,
   then: rm -rf $dir
 EOF
@@ -230,7 +230,7 @@ EOF
 cmd_revoke_client() {
   require_root; conf_load || die "not installed"
   local name=${1-} id
-  is_name "$name" || die "usage: ipsec-hub revoke-client NAME"
+  is_name "$name" || die "usage: qikehub revoke-client NAME"
   id=$(pki_revoke_entity client "$name" key-compromise) || die "no valid client '$name'"
   swan_install_creds
   swan_load
@@ -247,7 +247,7 @@ cmd_list_clients() {
 
 cmd_site_config() {
   require_root; conf_load || die "not installed"
-  [[ $HOME_ENABLED == yes ]] || die "home site disabled — run 'ipsec-hub configure'"
+  [[ $HOME_ENABLED == yes ]] || die "home site disabled — run 'qikehub configure'"
   local dir="$HUB_OUT/site-$HOME_NAME" id pass=""
   id=$(site_id)
   rm -rf "$dir"; install -d -m 0700 "$HUB_OUT" "$dir"
@@ -262,7 +262,7 @@ cmd_site_config() {
     pki_export_p12 "$PKI_KEY" "$PKI_CERT" "$id" "$dir/$HOME_NAME.p12"
     unset HUB_P12_PASS
     pki_destroy_key "$PKI_KEY"
-    install -m 0600 "$HUB_PKI/certs/ca.pem" "$dir/ipsec-hub-ca.pem"
+    install -m 0600 "$HUB_PKI/certs/ca.pem" "$dir/qikehub-ca.pem"
   fi
   profile_routeros > "$dir/$HOME_NAME.rsc"
   chmod 0600 "$dir"/*
@@ -279,12 +279,12 @@ cmd_status() {
   require_root; conf_load || die "not installed"
   hdr "Services"
   local u
-  for u in ipsec-hub-net "$SWAN_UNIT" nftables ipsec-hub-metrics.timer snmpd prometheus-node-exporter; do
+  for u in qikehub-net "$SWAN_UNIT" nftables qikehub-metrics.timer snmpd prometheus-node-exporter; do
     printf '  %-28s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null || true)"
   done
   hdr "Tunnels"
   "$HUB_LIBEXEC/collect-metrics.sh" || true
-  for u in "${MON_KEYS[@]}"; do printf '  %-18s %s\n' "$u" "$(cat "/run/ipsec-hub/snmp/$u" 2>/dev/null || echo U)"; done
+  for u in "${MON_KEYS[@]}"; do printf '  %-18s %s\n' "$u" "$(cat "/run/qikehub/snmp/$u" 2>/dev/null || echo U)"; done
   hdr "SAs"
   swanctl --list-sas 2>/dev/null | sed 's/^/  /' || true
   hdr "Config"
@@ -305,7 +305,7 @@ cmd_lockdown() {
 
 cmd_allow_ssh() {
   require_root; conf_load || die "not installed"
-  if [[ -z ${1-} ]] || ! is_src_list "$1"; then die "usage: ipsec-hub allow-ssh CIDR[,CIDR]"; fi
+  if [[ -z ${1-} ]] || ! is_src_list "$1"; then die "usage: qikehub allow-ssh CIDR[,CIDR]"; fi
   SSH_BOOTSTRAP=$1
   conf_save
   fw_apply

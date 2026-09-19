@@ -1,10 +1,10 @@
 # shellcheck shell=bash
-# ipsec-hub — common helpers: logging, prompts, validation, state.
+# qikehub — common helpers: logging, prompts, validation, state.
 
-: "${HUB_ETC:=/etc/ipsec-hub}"
-: "${HUB_VAR:=/var/lib/ipsec-hub}"
-: "${HUB_LIBEXEC:=/usr/local/lib/ipsec-hub}"
-: "${HUB_OPT:=/opt/ipsec-hub}"
+: "${HUB_ETC:=/etc/qikehub}"
+: "${HUB_VAR:=/var/lib/qikehub}"
+: "${HUB_LIBEXEC:=/usr/local/lib/qikehub}"
+: "${HUB_OPT:=/opt/qikehub}"
 : "${SWANCTL_DIR:=/etc/swanctl}"
 : "${HUB_NONINTERACTIVE:=0}"
 HUB_CONF="$HUB_ETC/hub.conf"
@@ -83,7 +83,7 @@ conf_save() {
   local tmp k
   tmp=$(mktemp "$HUB_ETC/.hub.conf.XXXXXX")
   {
-    printf '# ipsec-hub state — %s. Change with: ipsec-hub configure\n' "$(date -u +%FT%TZ)"
+    printf '# qikehub state — %s. Change with: qikehub configure\n' "$(date -u +%FT%TZ)"
     for k in "${HUB_KEYS[@]}"; do printf '%s=%q\n' "$k" "${!k-}"; done
   } > "$tmp"
   chmod 0600 "$tmp"
@@ -103,7 +103,7 @@ write_file() {
   local path=$1 mode=$2 dir tmp
   dir=$(dirname "$path")
   install -d "$dir"
-  tmp=$(mktemp "$dir/.ipsec-hub.XXXXXX")
+  tmp=$(mktemp "$dir/.qikehub.XXXXXX")
   cat > "$tmp"
   chmod "$mode" "$tmp"
   if [[ -f $path ]] && cmp -s "$tmp" "$path"; then

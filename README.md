@@ -1,4 +1,4 @@
-# ipsec-hub
+# qikehub
 
 Interactive installer that turns a small KVM VPS into an IKEv2/IPsec **full-tunnel hub**: phones and laptops connect to the VPS, a home router behind CGNAT connects outbound to the same VPS, and client traffic egresses either at the VPS or through home. Management (SSH, SNMPv3, Prometheus) is reachable **only through the tunnel**.
 
@@ -43,14 +43,14 @@ The port is not the security boundary — certificate-only IKEv2 with strict pro
 ## Quick start
 
 ```bash
-git clone https://github.com/<you>/ipsec-hub && cd ipsec-hub
-sudo ./ipsec-hub install          # interactive; installs itself to /opt/ipsec-hub
-sudo ipsec-hub add-client luca-iphone
-sudo ipsec-hub add-client luca-mac
-sudo ipsec-hub site-config        # RouterOS script + site identity
+git clone https://github.com/<you>/qikehub && cd qikehub
+sudo ./qikehub install          # interactive; installs itself to /opt/qikehub
+sudo qikehub add-client luca-iphone
+sudo qikehub add-client luca-mac
+sudo qikehub site-config        # RouterOS script + site identity
 # connect a client, then over the tunnel:
 ssh root@10.99.1.1
-sudo ipsec-hub lockdown           # closes public SSH
+sudo qikehub lockdown           # closes public SSH
 ```
 
 Firewall changes made over SSH are applied with a 60-second confirm-or-rollback: open a **new** SSH session, then type `ok`.
@@ -62,8 +62,8 @@ Non-interactive: export any key from `examples/hub.env.example` and run with `HU
 | Command | Purpose |
 |---|---|
 | `install` / `configure` | Wizard; re-run to change settings (current values become defaults) |
-| `render` | Re-apply sysctl, interfaces, strongSwan, nftables, monitoring from `/etc/ipsec-hub/hub.conf` |
-| `add-client NAME` | Issue identity; writes `.mobileconfig`, `.sswan`, `swanctl.conf`, `.p12` to `/var/lib/ipsec-hub/out/NAME/` |
+| `render` | Re-apply sysctl, interfaces, strongSwan, nftables, monitoring from `/etc/qikehub/hub.conf` |
+| `add-client NAME` | Issue identity; writes `.mobileconfig`, `.sswan`, `swanctl.conf`, `.p12` to `/var/lib/qikehub/out/NAME/` |
 | `revoke-client NAME` | CRL update, reload, terminate live SAs of that identity |
 | `list-clients` | Issued identities and status |
 | `site-config` | (Re)issue site identity (old one revoked) + RouterOS `.rsc` |
@@ -89,22 +89,22 @@ PKCS#12 files use PBE-SHA1-3DES + SHA-1 MAC because that is what Apple imports r
 - **CA on the hub:** convenient (issue/revoke from the box). For a stricter posture, move `pki/private/ca.key` offline after issuing and bring it back only to issue or revoke.
 - **Revocation:** local CRL (10-year validity, re-signed on every change) loaded into charon; revoking also tears down live SAs.
 - **Host:** key-only sshd drop-in, unattended security upgrades, loose RPF (required for home egress), redirects/source-route off.
-- **State & secrets:** `/etc/ipsec-hub` (0700). Nothing secret lives in the repo; `.gitignore` blocks common artefacts.
+- **State & secrets:** `/etc/qikehub` (0700). Nothing secret lives in the repo; `.gitignore` blocks common artefacts.
 
 ## Monitoring
 
-Collector timer (30 s) → `/run/ipsec-hub/snmp/*` and `/var/lib/prometheus/node-exporter/ipsec_hub.prom`.
+Collector timer (30 s) → `/run/qikehub/snmp/*` and `/var/lib/prometheus/node-exporter/qikehub.prom`.
 
 ```bash
 # Prometheus
-curl -s http://10.99.1.1:9100/metrics | grep ^ipsec_hub
+curl -s http://10.99.1.1:9100/metrics | grep ^qikehub
 
-# SNMPv3 (credentials: /etc/ipsec-hub/secrets/snmp.env)
+# SNMPv3 (credentials: /etc/qikehub/secrets/snmp.env)
 snmpwalk -v3 -l authPriv -u monitor -a SHA-256 -A "$AUTH" -x AES -X "$PRIV" \
   10.99.1.1 NET-SNMP-EXTEND-MIB::nsExtendOutput1Line
 ```
 
-Keys: `charon_up home_up rw_ike_sas rw_child_sas home_ike_sas home_child_sas rw_bytes_in rw_bytes_out home_bytes_in home_bytes_out pool4_online server_cert_days` (SNMP extend names are `ipsecHub_<key>`). The collector parses `swanctl --list-sas` text output; if a future strongSwan changes that format, switch it to VICI (`python3-vici`).
+Keys: `charon_up home_up rw_ike_sas rw_child_sas home_ike_sas home_child_sas rw_bytes_in rw_bytes_out home_bytes_in home_bytes_out pool4_online server_cert_days` (SNMP extend names are `qikehub_<key>`). The collector parses `swanctl --list-sas` text output; if a future strongSwan changes that format, switch it to VICI (`python3-vici`).
 
 ## Home site (RouterOS 7)
 
@@ -136,13 +136,13 @@ ss -ulpn | grep charon        # 500 + published port only
 ## Files
 
 ```
-ipsec-hub                 CLI (installed to /opt/ipsec-hub, linked as /usr/local/sbin/ipsec-hub)
+qikehub                 CLI (installed to /opt/qikehub, linked as /usr/local/sbin/qikehub)
 lib/*.sh                  common, net, pki, strongswan, firewall, monitoring, system, profiles
-/etc/ipsec-hub/           hub.conf, pki/, secrets/            (root 0700)
-/etc/swanctl/conf.d/ipsec-hub.conf, /etc/strongswan.d/zz-ipsec-hub.conf
-/etc/nftables.conf, /etc/sysctl.d/90-ipsec-hub.conf
-/usr/local/lib/ipsec-hub/ net-up.sh, collect-metrics.sh, snmp-read
-/var/lib/ipsec-hub/out/   generated client/site bundles       (delete after use)
+/etc/qikehub/           hub.conf, pki/, secrets/            (root 0700)
+/etc/swanctl/conf.d/qikehub.conf, /etc/strongswan.d/zz-qikehub.conf
+/etc/nftables.conf, /etc/sysctl.d/90-qikehub.conf
+/usr/local/lib/qikehub/ net-up.sh, collect-metrics.sh, snmp-read
+/var/lib/qikehub/out/   generated client/site bundles       (delete after use)
 ```
 
 ## License

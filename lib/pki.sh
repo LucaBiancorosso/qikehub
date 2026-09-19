@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# ipsec-hub — PKI (strongSwan pki): ECDSA P-384 / SHA-384 throughout.
+# qikehub — PKI (strongSwan pki): ECDSA P-384 / SHA-384 throughout.
 # Layout: $HUB_PKI/{private/ca.key,private/server.key,certs/ca.pem,issued/*.pem,crl/crl.pem,index.tsv}
 # Client/site private keys exist only long enough to build the PKCS#12, then are shredded.
 
@@ -25,10 +25,10 @@ pki_init() {
   hdr "PKI"
   install -d -m 0700 "$HUB_PKI" "$HUB_PKI/private"
   install -d -m 0755 "$HUB_PKI/certs" "$HUB_PKI/issued" "$HUB_PKI/crl"
-  local cn; cn="ipsec-hub CA $(gen_secret 8)"
+  local cn; cn="qikehub CA $(gen_secret 8)"
   ( umask 077; pki --gen --type ecdsa --size 384 --outform pem > "$HUB_PKI/private/ca.key" )
   pki --self --ca --lifetime "$PKI_CA_DAYS" --in "$HUB_PKI/private/ca.key" --type ecdsa \
-      --digest sha384 --dn "O=ipsec-hub, CN=$cn" --outform pem > "$HUB_PKI/certs/ca.pem"
+      --digest sha384 --dn "O=qikehub, CN=$cn" --outform pem > "$HUB_PKI/certs/ca.pem"
   printf '%s\n' "$cn" > "$HUB_PKI/ca.cn"
   : > "$HUB_PKI/index.tsv"
   pki_crl_update
@@ -53,7 +53,7 @@ pki_ensure_server() {
   if [[ -f $cert && $want == "$have" ]] && openssl x509 -in "$cert" -noout -checkend $((30*86400)) >/dev/null; then
     return 0
   fi
-  pki_issue server "O=ipsec-hub, CN=$HUB_FQDN" "$PKI_SERVER_DAYS" \
+  pki_issue server "O=qikehub, CN=$HUB_FQDN" "$PKI_SERVER_DAYS" \
     --san "$HUB_FQDN" --san "$PUBLIC_IP4" --flag serverAuth --flag ikeIntermediate
   printf '%s\n' "$want" > "$HUB_PKI/server.meta"
   log "server certificate issued: $HUB_FQDN, $PUBLIC_IP4"
@@ -77,7 +77,7 @@ pki_issue_entity() {
   local type=$1 name=$2 id=$3 ou base serial cert
   case $type in client) ou=clients ;; site) ou=sites ;; *) die "bad type $type" ;; esac
   base="$type-$name"
-  pki_issue "$base" "O=ipsec-hub, OU=$ou, CN=$id" "$PKI_CLIENT_DAYS" --san "$id" --flag clientAuth
+  pki_issue "$base" "O=qikehub, OU=$ou, CN=$id" "$PKI_CLIENT_DAYS" --san "$id" --flag clientAuth
   serial=$(pki_serial "$HUB_PKI/issued/$base.pem")
   cert="$HUB_PKI/issued/$base-$serial.pem"
   mv -f "$HUB_PKI/issued/$base.pem" "$cert"

@@ -15,7 +15,7 @@
     </style>
   </defs>
 
-  <text x="20" y="30" class="t" font-size="17">ipsec-hub — IKEv2 full-tunnel hub</text>
+  <text x="20" y="30" class="t" font-size="17">qikehub — IKEv2 full-tunnel hub</text>
 
   <!-- clients -->
   <rect class="box" x="20" y="70" width="200" height="62" rx="8"/>
@@ -52,7 +52,7 @@
   <rect class="mg" x="350" y="322" width="330" height="72" rx="6"/>
   <text x="364" y="344" class="t">mgmt0 10.99.1.1/32 (tunnel-only)</text>
   <text x="364" y="364" class="s">SSH · SNMPv3 authPriv · node_exporter :9100</text>
-  <text x="364" y="382" class="s">ipsec_hub_* metrics / NET-SNMP-EXTEND</text>
+  <text x="364" y="382" class="s">qikehub_* metrics / NET-SNMP-EXTEND</text>
 
   <rect class="sub" x="350" y="410" width="330" height="72" rx="6"/>
   <text x="364" y="432" class="t">Egress</text>
