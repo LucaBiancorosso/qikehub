@@ -199,8 +199,10 @@ render_wg_conf() {
   local priv; priv=$(<"$HUB_ETC/server.key")
   printf '[Interface]\nPrivateKey = %s\nListenPort = %s\n' "$priv" "$WG_PORT"
   if [[ -f $HUB_PEERS ]]; then
-    local name ip4 ip6 pub allowed
-    while IFS=$'\t' read -r name ip4 ip6 pub; do
+    local line name ip4 ip6 pub allowed
+    while IFS= read -r line; do
+      name=$(cut -f1 <<<"$line"); ip4=$(cut -f2 <<<"$line")
+      ip6=$(cut -f3 <<<"$line"); pub=$(cut -f4 <<<"$line")
       allowed="$ip4/32"; [[ -n $ip6 ]] && allowed+=", $ip6/128"
       printf '\n[Peer]\n# %s\nPublicKey = %s\nAllowedIPs = %s\n' "$name" "$pub" "$allowed"
     done < "$HUB_PEERS"
@@ -251,7 +253,6 @@ render_net_unit() {
 [Unit]
 Description=qikehub WireGuard interface, address and policy routing
 After=network.target
-Before=wg-quick@$WG_IF.service
 
 [Service]
 Type=oneshot
@@ -415,6 +416,11 @@ render_site_rsc() { # SITE_PRIVATE_KEY
 /ip address add address=$(home_ip4)/32 interface=wg-hub
 /ip route add dst-address=$POOL4 gateway=wg-hub
 /ip firewall filter add chain=input action=accept protocol=udp dst-port=51820 comment="qikehub site"
+
+# without these, decrypted VPN traffic hits RouterOS's default forward drop —
+# it has no idea wg-hub should be trusted just because it's a WireGuard interface.
+/ip firewall filter add chain=forward action=accept connection-state=established,related place-before=0 comment="qikehub: return traffic"
+/ip firewall filter add chain=forward action=accept in-interface=wg-hub place-before=0 comment="qikehub: vpn to lan/wan"
 EOF
   if [[ $EGRESS == home ]]; then
     cat <<EOF
@@ -738,8 +744,10 @@ cmd_list_clients() {
   require_root; conf_load || die "not installed"
   printf '%-20s %-18s %-45s %-12s %s\n' NAME IP PUBKEY LATEST-HS TRANSFER
   [[ -f $HUB_PEERS ]] || return 0
-  local name ip4 ip6 pub line lasths rx tx
-  while IFS=$'\t' read -r name ip4 ip6 pub; do
+  local raw name ip4 ip6 pub line lasths rx tx
+  while IFS= read -r raw; do
+    name=$(cut -f1 <<<"$raw"); ip4=$(cut -f2 <<<"$raw")
+    ip6=$(cut -f3 <<<"$raw"); pub=$(cut -f4 <<<"$raw")
     line=$(wg show "$WG_IF" dump 2>/dev/null | awk -v p="$pub" '$1==p') || true
     lasths=U; rx=0; tx=0
     if [[ -n $line ]]; then
