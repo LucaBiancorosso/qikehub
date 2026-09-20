@@ -55,6 +55,10 @@ sudo qikehub lockdown           # closes public SSH
 
 Firewall changes made over SSH are applied with a 60-second confirm-or-rollback: open a **new** SSH session, then type `ok`.
 
+On a brand-new install, public SSH stays reachable (from your detected client IP if you connected over SSH, otherwise from anywhere — e.g. installing from a provider's web console) until you run `lockdown`. Re-running `configure` later never reopens it on its own.
+
+Progress messages (`[+] ...`) are off by default — prompts, warnings and errors always show. Set `HUB_VERBOSE=1` for per-step confirmations.
+
 Non-interactive: export any key from `examples/hub.env.example` and run with `HUB_NONINTERACTIVE=1`.
 
 ## Commands

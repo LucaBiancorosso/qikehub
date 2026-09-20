@@ -7,6 +7,7 @@
 : "${HUB_OPT:=/opt/qikehub}"
 : "${SWANCTL_DIR:=/etc/swanctl}"
 : "${HUB_NONINTERACTIVE:=0}"
+: "${HUB_VERBOSE:=0}"
 HUB_CONF="$HUB_ETC/hub.conf"
 HUB_PKI="$HUB_ETC/pki"
 HUB_SECRETS="$HUB_ETC/secrets"
@@ -29,7 +30,7 @@ else
   C_R='' C_G='' C_Y='' C_B='' C_0=''
 fi
 
-log()  { printf '%s[+]%s %s\n' "$C_G" "$C_0" "$*"; }
+log()  { [[ $HUB_VERBOSE == 1 ]] || return 0; printf '%s[+]%s %s\n' "$C_G" "$C_0" "$*"; }
 warn() { printf '%s[!]%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
 die()  { printf '%s[x]%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
 hdr()  { printf '\n%s== %s ==%s\n' "$C_B" "$*" "$C_0"; }

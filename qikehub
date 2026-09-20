@@ -37,6 +37,8 @@ Usage: qikehub <command> [args]
 
 Non-interactive: HUB_NONINTERACTIVE=1 with settings pre-set as env vars
 (see examples/hub.env.example).
+Progress messages are off by default (prompts/warnings/errors always show);
+set HUB_VERBOSE=1 for per-step confirmations.
 EOF
 }
 
@@ -158,6 +160,11 @@ EOF
       if [[ $boot == *:* ]]; then boot="$boot/128"; else boot="$boot/32"; fi
     fi
   fi
+  # brand-new install (no prior hub.conf, no env preset — SSH_BOOTSTRAP truly unset,
+  # not just loaded as ""): keep public SSH reachable until 'qikehub lockdown' is run,
+  # from the detected client if we know it, else from anywhere. A reconfigure after
+  # lockdown must NOT reopen this — SSH_BOOTSTRAP already loaded as "" is left alone.
+  if [[ -z ${SSH_BOOTSTRAP+x} ]]; then boot=${boot:-"0.0.0.0/0,::/0"}; fi
   ask SSH_BOOTSTRAP "Temporary public SSH sources ('-' = none)" "$boot" is_src_list
   ask_choice SNMP_ENABLED "SNMPv3 agent on $MGMT4" yes "yes no"
   if [[ $SNMP_ENABLED == yes ]]; then ask SNMP_USER "SNMPv3 user" monitor is_name; fi
