@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# qikehub — IKEv2/IPsec full-tunnel hub for a small VPS (Debian 13).
-# https://github.com/<you>/qikehub — SPDX-License-Identifier: MIT
+# qikehub — WireGuard hub for a small VPS: roaming clients + an optional home site.
+# One file, on purpose: WireGuard removes almost everything that made the IPsec
+# version (see ../qikehub) complex — no CA/CRL, no XFRM interfaces, no charon,
+# one fixed modern cipher suite. https://github.com/LucaBiancorosso/qikehub
+# SPDX-License-Identifier: MIT
 set -Eeuo pipefail
 umask 022
 
@@ -8,87 +11,600 @@ HUB_VERSION="0.1.0"
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 HUB_SRC=$(dirname "$SELF")
 
-for _lib in common net pki strongswan firewall monitoring system profiles; do
-  # shellcheck source=/dev/null
-  . "$HUB_SRC/lib/$_lib.sh"
-done
-unset _lib
+: "${HUB_ETC:=/etc/qikehub}"
+: "${HUB_VAR:=/var/lib/qikehub}"
+: "${HUB_OPT:=/opt/qikehub}"
+: "${HUB_NONINTERACTIVE:=0}"
+: "${HUB_VERBOSE:=0}"
+HUB_CONF="$HUB_ETC/hub.conf"
+HUB_PEERS="$HUB_ETC/peers.tsv"          # name  ip4  ip6  pubkey
+HUB_OUT="$HUB_VAR/out"
+WG_IF=wg0
+NFT_CONF=/etc/nftables.conf
+RT_TABLE_HOME=220
+
+# Persisted state (hub.conf). Everything else is derived or lives in peers.tsv.
+HUB_KEYS=(
+  HUB_FQDN WAN_IF PUBLIC_IP4
+  WG_PORT POOL4 POOL6 IPV6_MODE
+  CLIENT_DNS
+  EGRESS HOME_ENABLED HOME_NAME HOME_LANS
+  SSH_BOOTSTRAP HARDEN_SSH AUTO_UPDATES
+)
+
+if [[ -t 1 ]]; then
+  C_R=$'\e[31m' C_G=$'\e[32m' C_Y=$'\e[33m' C_B=$'\e[1m' C_0=$'\e[0m'
+else
+  C_R='' C_G='' C_Y='' C_B='' C_0=''
+fi
+
+log()  { [[ $HUB_VERBOSE == 1 ]] || return 0; printf '%s[+]%s %s\n' "$C_G" "$C_0" "$*"; }
+warn() { printf '%s[!]%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+die()  { printf '%s[x]%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
+hdr()  { printf '\n%s== %s ==%s\n' "$C_B" "$*" "$C_0"; }
 
 on_err() { printf '%s[x]%s failed (rc=%s) at line %s: %s\n' "$C_R" "$C_0" "$1" "$2" "$3" >&2; }
 trap 'on_err $? $LINENO "$BASH_COMMAND"' ERR
 
+require_root() { [[ $EUID -eq 0 ]] || die "must run as root"; }
+
+# --- prompts -----------------------------------------------------------------
+ask() {
+  local _v=$1 _p=$2 _d=${3-} _chk=${4-} _a
+  if [[ -n ${!_v-} ]]; then _d=${!_v}; fi
+  if [[ $HUB_NONINTERACTIVE == 1 ]]; then
+    _a=$_d
+  else
+    while :; do
+      read -r -p "  $_p [${_d}]: " _a || die "aborted"
+      _a=${_a:-$_d}
+      if [[ $_a == "-" ]]; then _a=""; fi
+      if [[ -z $_chk ]] || "$_chk" "$_a"; then break; fi
+      warn "invalid value: '$_a'"
+    done
+  fi
+  if [[ -n $_chk ]] && ! "$_chk" "$_a"; then die "invalid value for $_v: '$_a'"; fi
+  printf -v "$_v" '%s' "$_a"
+}
+
+_CHOICES=""
+_in_choices() { local c; for c in $_CHOICES; do [[ $1 == "$c" ]] && return 0; done; return 1; }
+ask_choice() { _CHOICES=$4; ask "$1" "$2 (${4// /|})" "$3" _in_choices; }
+
+confirm() {
+  [[ $HUB_NONINTERACTIVE == 1 ]] && return 0
+  local a; read -r -p "  $1 [y/N]: " a || return 1
+  [[ $a =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+# --- validators ---------------------------------------------------------------
+is_fqdn() { [[ $1 =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]; }
+is_name() { [[ $1 =~ ^[a-z0-9][a-z0-9-]{0,30}[a-z0-9]$ ]]; }
+is_port() { [[ $1 =~ ^[0-9]{4,5}$ ]] && (( 10#$1 >= 1024 && 10#$1 <= 65535 )); }
+is_ifname() { [[ $1 =~ ^[a-zA-Z0-9._-]{1,15}$ ]] && ip link show "$1" >/dev/null 2>&1; }
+is_ipv4() {
+  [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local i; for i in 1 2 3 4; do (( 10#${BASH_REMATCH[i]} <= 255 )) || return 1; done
+}
+is_cidr4() {
+  [[ $1 =~ ^([0-9.]+)/([0-9]{1,2})$ ]] || return 1
+  local ip=${BASH_REMATCH[1]} len=$((10#${BASH_REMATCH[2]})) n mask
+  is_ipv4 "$ip" || return 1
+  (( len <= 32 )) || return 1
+  n=$(ip2int "$ip")
+  mask=$(( len == 0 ? 0 : (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+  (( (n & mask) == n ))
+}
+is_cidr4_list() { [[ -n $1 ]] || return 1; local IFS=, c; for c in $1; do is_cidr4 "$c" || return 1; done; }
+is_ipv4_list()  { [[ -n $1 ]] || return 1; local IFS=, c; for c in $1; do is_ipv4 "$c" || return 1; done; }
+is_src_list() {
+  [[ -z $1 ]] && return 0
+  local IFS=, c
+  for c in $1; do
+    is_ipv4 "$c" || is_cidr4 "$c" || [[ $c =~ ^[0-9a-fA-F:]+:[0-9a-fA-F:]*(/[0-9]{1,3})?$ ]] || return 1
+  done
+}
+is_pool24() { is_cidr4 "$1" && [[ ${1#*/} == 24 ]]; }
+
+ip2int() { local IFS=. a b c d; read -r a b c d <<<"$1"; echo $(( (10#$a<<24) | (10#$b<<16) | (10#$c<<8) | 10#$d )); }
+int2ip() { local n=$1; echo "$(( (n>>24)&255 )).$(( (n>>16)&255 )).$(( (n>>8)&255 )).$(( n&255 ))"; }
+cidr4_bounds() { local n; n=$(ip2int "${1%/*}"); echo "$n $(( n + (1 << (32 - ${1#*/})) - 1 ))"; }
+cidr4_overlap() {
+  local a1 a2 b1 b2
+  read -r a1 a2 < <(cidr4_bounds "$1"); read -r b1 b2 < <(cidr4_bounds "$2")
+  (( a1 <= b2 && b1 <= a2 ))
+}
+
+# --- state ---------------------------------------------------------------------
+conf_save() {
+  install -d -m 0700 "$HUB_ETC"
+  local tmp k
+  tmp=$(mktemp "$HUB_ETC/.hub.conf.XXXXXX")
+  {
+    printf '# qikehub state — %s. Change with: qikehub configure\n' "$(date -u +%FT%TZ)"
+    for k in "${HUB_KEYS[@]}"; do printf '%s=%q\n' "$k" "${!k-}"; done
+  } > "$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$HUB_CONF"
+}
+conf_load() {
+  [[ -f $HUB_CONF ]] || return 1
+  [[ $(stat -c '%u %a' "$HUB_CONF") == "0 600" ]] || die "$HUB_CONF must be root-owned, mode 0600"
+  # shellcheck source=/dev/null
+  . "$HUB_CONF"
+}
+
+# write_file PATH MODE < content — atomic; every apply step restarts its own
+# service unconditionally (wg syncconf and the net-up.sh script are idempotent),
+# so unlike the IPsec version this doesn't need to track "did content change".
+write_file() {
+  local path=$1 mode=$2 dir tmp
+  dir=$(dirname "$path")
+  install -d "$dir"
+  tmp=$(mktemp "$dir/.qikehub.XXXXXX")
+  cat > "$tmp"
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$path"
+}
+
+rand_port()  { shuf -i 20000-60999 -n 1; }
+detect_wan_if() { ip -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
+detect_public_ip4() { ip -4 -o addr show dev "$1" scope global 2>/dev/null | awk 'NR==1{split($4,a,"/"); print a[1]}'; }
+has_global_ip6() { [[ -n $(ip -6 -o addr show dev "$1" scope global 2>/dev/null) ]]; }
+gen_ula_pool6() { local h; h=$(od -An -tx1 -N5 /dev/urandom | tr -d ' \n'); printf 'fd%s:%s:%s:1::/112\n' "${h:0:2}" "${h:2:4}" "${h:6:4}"; }
+check_dns() {
+  local r; r=$(getent ahostsv4 "$HUB_FQDN" 2>/dev/null | awk 'NR==1{print $1}')
+  if [[ -z $r ]]; then warn "$HUB_FQDN does not resolve yet — create the A record before onboarding clients"
+  elif [[ $r != "$PUBLIC_IP4" ]]; then warn "$HUB_FQDN resolves to $r, not $PUBLIC_IP4"; fi
+}
+
+# server_ip4/server_ip6: fixed first address of the pool (the "hub" endpoint,
+# reachable as the management address once a client is on the tunnel).
+server_ip4() { int2ip $(( $(ip2int "${POOL4%/*}") + 1 )); }
+server_ip6() { local base=${POOL6%::*}; printf '%s::1' "$base"; }
+# home site (if enabled) gets the last usable address in POOL4, out of the way
+# of sequential client allocation from the low end.
+home_ip4()   { int2ip $(( $(ip2int "${POOL4%/*}") + 254 )); }
+
+# --- peers.tsv: name  ip4  ip6  pubkey ----------------------------------------
+peer_row()   { [[ -f $HUB_PEERS ]] || return 0; awk -F'\t' -v n="$1" '$1==n' "$HUB_PEERS"; }
+peer_next_ip4() {
+  local base used i cand
+  base=$(ip2int "${POOL4%/*}")
+  used=$( { [[ -f $HUB_PEERS ]] && cut -f2 "$HUB_PEERS"; server_ip4; [[ $HOME_ENABLED == yes ]] && home_ip4; true; } )
+  for ((i = 2; i <= 250; i++)); do
+    cand=$(int2ip $(( base + i )))
+    grep -qx "$cand" <<<"$used" || { echo "$cand"; return 0; }
+  done
+  die "client pool exhausted (POOL4 too small for this many clients)"
+}
+peer_next_ip6() {
+  [[ -z ${POOL6-} ]] && return 0
+  local base used i cand
+  base=${POOL6%::*}
+  used=$( [[ -f $HUB_PEERS ]] && cut -f3 "$HUB_PEERS"; true )
+  for ((i = 2; i <= 65534; i++)); do
+    cand=$(printf '%s::%x' "$base" "$i")
+    grep -qx "$cand" <<<"$used" || { echo "$cand"; return 0; }
+  done
+}
+
+# pki_destroy_key-equivalent: WireGuard keys are one line of base64, shred is overkill
+# but costs nothing and matches the same "no private key lingers" discipline.
+wg_genkey() { wg genkey; }
+wg_pubkey() { wg pubkey <<<"$1"; }
+
+# --- rendering (pure: stdout only) ---------------------------------------------
+render_wg_conf() {
+  local priv; priv=$(<"$HUB_ETC/server.key")
+  printf '[Interface]\nPrivateKey = %s\nListenPort = %s\n' "$priv" "$WG_PORT"
+  if [[ -f $HUB_PEERS ]]; then
+    local name ip4 ip6 pub allowed
+    while IFS=$'\t' read -r name ip4 ip6 pub; do
+      allowed="$ip4/32"; [[ -n $ip6 ]] && allowed+=", $ip6/128"
+      printf '\n[Peer]\n# %s\nPublicKey = %s\nAllowedIPs = %s\n' "$name" "$pub" "$allowed"
+    done < "$HUB_PEERS"
+  fi
+  if [[ $HOME_ENABLED == yes && -f $HUB_ETC/site-$HOME_NAME.pub ]]; then
+    local allowed=$HOME_LANS
+    [[ $EGRESS == home ]] && allowed="$allowed, $(home_ip4)/32"
+    printf '\n[Peer]\n# site: %s\nPublicKey = %s\nAllowedIPs = %s\nPersistentKeepalive = 25\n' \
+      "$HOME_NAME" "$(<"$HUB_ETC/site-$HOME_NAME.pub")" "$allowed"
+  fi
+}
+
+render_net_script() {
+  local prefix4=${POOL4#*/}
+  cat <<EOF
+#!/bin/sh
+# Generated by qikehub — do not edit; run 'qikehub render'.
+set -eu
+modprobe wireguard 2>/dev/null || true
+ip link show $WG_IF >/dev/null 2>&1 || ip link add $WG_IF type wireguard
+ip address replace '$(server_ip4)/$prefix4' dev $WG_IF
+EOF
+  [[ -n ${POOL6-} ]] && printf "ip -6 address replace '%s/64' dev %s 2>/dev/null || true\n" "$(server_ip6)" "$WG_IF"
+  cat <<EOF
+ip link set $WG_IF up
+
+ip rule del from '$POOL4' table $RT_TABLE_HOME priority 1000 2>/dev/null || true
+ip route flush table $RT_TABLE_HOME 2>/dev/null || true
+EOF
+  if [[ $HOME_ENABLED == yes ]]; then
+    local lan
+    for lan in ${HOME_LANS//,/ }; do printf "ip route replace '%s' dev %s\n" "$lan" "$WG_IF"; done
+  fi
+  if [[ $EGRESS == home && $HOME_ENABLED == yes ]]; then
+    cat <<EOF
+
+# EGRESS=home: all client IPv4 leaves via the home site. Fail-closed: WireGuard
+# only forwards a packet to a peer with a live session; no session, no route,
+# no VPS egress — never falls back.
+ip route replace default via '$(home_ip4)' dev $WG_IF table $RT_TABLE_HOME
+ip rule add from '$POOL4' table $RT_TABLE_HOME priority 1000
+EOF
+  fi
+}
+
+render_net_unit() {
+  cat <<EOF
+[Unit]
+Description=qikehub WireGuard interface, address and policy routing
+After=network.target
+Before=wg-quick@$WG_IF.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$HUB_ETC/net-up.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+render_wg_unit() {
+  cat <<EOF
+[Unit]
+Description=qikehub WireGuard config (sync only, interface managed by qikehub-net)
+After=qikehub-net.service
+Requires=qikehub-net.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/wg syncconf $WG_IF $HUB_ETC/wg0.conf
+ExecReload=/usr/bin/wg syncconf $WG_IF $HUB_ETC/wg0.conf
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+render_sysctl() {
+  cat <<EOF
+# Generated by qikehub
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv4.tcp_syncookies = 1
+EOF
+  if [[ $EGRESS == home ]]; then
+    cat <<EOF
+# EGRESS=home needs asymmetric routing tolerated on the WAN side
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+EOF
+  fi
+}
+
+render_firewall() {
+  local -a boot4=() boot6=() src
+  IFS=, read -ra src <<<"${SSH_BOOTSTRAP-}"
+  local c
+  for c in "${src[@]}"; do
+    [[ -z $c ]] && continue
+    if [[ $c == *:* ]]; then boot6+=("$c"); else boot4+=("$c"); fi
+  done
+  cat <<EOF
+#!/usr/sbin/nft -f
+# Generated by qikehub — overwritten by 'qikehub render'.
+flush ruleset
+
+table inet qikehub {
+EOF
+  if ((${#boot4[@]})); then
+    printf '  set ssh_boot4 { type ipv4_addr; flags interval; elements = { %s }; }\n' "$(IFS=,; echo "${boot4[*]}")"
+  else
+    printf '  set ssh_boot4 { type ipv4_addr; flags interval; }\n'
+  fi
+  if ((${#boot6[@]})); then
+    printf '  set ssh_boot6 { type ipv6_addr; flags interval; elements = { %s }; }\n' "$(IFS=,; echo "${boot6[*]}")"
+  else
+    printf '  set ssh_boot6 { type ipv6_addr; flags interval; }\n'
+  fi
+  cat <<EOF
+
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+EOF
+  [[ $EGRESS == vps ]] && printf '    oifname "%s" ip saddr %s masquerade\n' "$WAN_IF" "$POOL4"
+  [[ $IPV6_MODE == nat66 && -n ${POOL6-} ]] && printf '    oifname "%s" ip6 saddr %s masquerade\n' "$WAN_IF" "$POOL6"
+  cat <<EOF
+  }
+
+  chain input {
+    type filter hook input priority filter; policy drop;
+    iif "lo" accept
+    ct state invalid drop
+    ct state { established, related } accept
+
+    icmp type echo-request limit rate 10/second accept
+    icmp type { destination-unreachable, time-exceeded, parameter-problem } accept
+    icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert, packet-too-big, destination-unreachable, time-exceeded, parameter-problem } accept
+    icmpv6 type echo-request limit rate 10/second accept
+    iifname "$WAN_IF" udp sport 67 udp dport 68 accept
+
+    udp dport $WG_PORT accept
+
+    iifname "$WG_IF" tcp dport 22 accept
+
+    iifname "$WAN_IF" ip saddr @ssh_boot4 tcp dport 22 accept
+    iifname "$WAN_IF" ip6 saddr @ssh_boot6 tcp dport 22 accept
+
+    limit rate 6/minute burst 10 packets log prefix "qikehub in-drop: " level info
+  }
+
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    ct state invalid drop
+    ct state { established, related } accept
+    tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
+
+    iifname "$WG_IF" accept
+EOF
+  [[ $EGRESS == vps ]] && printf '    oifname "%s" meta nfproto ipv4 accept\n' "$WAN_IF"
+  if [[ $IPV6_MODE == nat66 && -n ${POOL6-} ]]; then
+    printf '    oifname "%s" meta nfproto ipv6 accept\n' "$WAN_IF"
+  else
+    printf '    # IPv6 is captured by the client (::/0 in its AllowedIPs) and refused fast\n'
+    printf '    iifname "%s" meta nfproto ipv6 reject with icmpv6 type admin-prohibited\n' "$WG_IF"
+  fi
+  cat <<EOF
+
+    limit rate 6/minute burst 10 packets log prefix "qikehub fwd-drop: " level info
+  }
+}
+EOF
+}
+
+render_client_conf() { # NAME
+  local name=$1 row ip4 ip6 priv allowed
+  row=$(peer_row "$name"); ip4=$(cut -f2 <<<"$row"); ip6=$(cut -f3 <<<"$row")
+  priv=$(<"$HUB_ETC/client-$name.key")
+  allowed="0.0.0.0/0"; [[ -n ${POOL6-} ]] && allowed+=", ::/0"
+  cat <<EOF
+[Interface]
+PrivateKey = $priv
+Address = $ip4/32$([[ -n $ip6 ]] && printf ', %s/128' "$ip6")
+DNS = $CLIENT_DNS
+
+[Peer]
+PublicKey = $(<"$HUB_ETC/server.pub")
+Endpoint = $HUB_FQDN:$WG_PORT
+AllowedIPs = $allowed
+PersistentKeepalive = 25
+EOF
+}
+
+render_site_rsc() { # SITE_PRIVATE_KEY
+  local priv=$1 pub
+  pub=$(<"$HUB_ETC/server.pub")
+  cat <<EOF
+# qikehub site '$HOME_NAME' — RouterOS 7 (native WireGuard) — generated $(date -u +%FT%TZ)
+# Contains the site's private key — delete this file from the router after import.
+
+/interface wireguard add name=wg-hub listen-port=51820 private-key="$priv"
+/interface wireguard peers add interface=wg-hub public-key="$pub" \\
+    endpoint-address=$HUB_FQDN endpoint-port=$WG_PORT \\
+    allowed-address=$POOL4 persistent-keepalive=25s
+/ip address add address=$(home_ip4)/32 interface=wg-hub
+/ip route add dst-address=$POOL4 gateway=wg-hub
+/ip firewall filter add chain=input action=accept protocol=udp dst-port=51820 comment="qikehub site"
+EOF
+  if [[ $EGRESS == home ]]; then
+    cat <<EOF
+
+# EGRESS=home: clients browse via this router
+/ip firewall nat add chain=srcnat action=masquerade src-address=$POOL4 out-interface-list=WAN comment="qikehub: client egress"
+EOF
+  fi
+}
+
+# --- apply --------------------------------------------------------------------
+net_apply() {
+  hdr "Interface"
+  write_file /etc/sysctl.d/90-qikehub.conf 0644 < <(render_sysctl)
+  sysctl -q --system >/dev/null 2>&1 || warn "sysctl --system reported errors (check: sysctl --system)"
+  write_file "$HUB_ETC/net-up.sh" 0755 < <(render_net_script)
+  write_file /etc/systemd/system/qikehub-net.service 0644 < <(render_net_unit)
+  systemctl daemon-reload
+  systemctl enable qikehub-net.service >/dev/null 2>&1
+  systemctl restart qikehub-net.service
+  log "$WG_IF $(server_ip4) up, listening on UDP/$WG_PORT"
+}
+
+wg_apply() {
+  hdr "WireGuard"
+  [[ -s $HUB_ETC/server.key ]] || { ( umask 077; wg_genkey > "$HUB_ETC/server.key" ); wg_pubkey "$(<"$HUB_ETC/server.key")" > "$HUB_ETC/server.pub"; }
+  write_file "$HUB_ETC/wg0.conf" 0600 < <(render_wg_conf)
+  write_file /etc/systemd/system/qikehub-wg.service 0644 < <(render_wg_unit)
+  systemctl daemon-reload
+  systemctl enable qikehub-wg.service >/dev/null 2>&1
+  systemctl restart qikehub-wg.service
+  log "config synced: $([[ -f $HUB_PEERS ]] && wc -l < "$HUB_PEERS" || echo 0) client(s)$([[ $HOME_ENABLED == yes ]] && echo ", home")"
+}
+
+fw_apply() {
+  hdr "Firewall"
+  local new backup ans
+  new=$(mktemp); backup=$(mktemp)
+  render_firewall > "$new"
+  nft -c -f "$new" || die "nft syntax check failed ($new)"
+  { echo "flush ruleset"; nft list ruleset 2>/dev/null || true; } > "$backup"
+  nft -f "$new"
+  if [[ -n ${SSH_CONNECTION-} && $HUB_NONINTERACTIVE != 1 ]]; then
+    warn "Ruleset applied. Open a NEW ssh session to confirm access, then type 'ok' here (60s, else rollback)."
+    if ! read -r -t 60 -p "  confirm: " ans || [[ $ans != ok ]]; then
+      nft -f "$backup"; rm -f "$new" "$backup"
+      die "no confirmation — previous ruleset restored, nothing persisted"
+    fi
+  fi
+  install -m 0644 "$new" "$NFT_CONF"
+  rm -f "$new" "$backup"
+  write_file /etc/systemd/system/nftables.service.d/qikehub.conf 0644 <<EOF
+[Unit]
+Wants=qikehub-net.service
+After=qikehub-net.service
+EOF
+  systemctl daemon-reload
+  systemctl enable nftables.service >/dev/null 2>&1 || true
+  log "nftables persisted to $NFT_CONF (public: UDP/$WG_PORT only)"
+}
+
+harden_ssh() {
+  hdr "sshd"
+  local f found=0
+  for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+    [[ -s $f ]] && found=1
+  done
+  if (( ! found )); then
+    warn "no authorized_keys found — NOT disabling password auth (add a key, then re-run 'qikehub render')"
+    return 0
+  fi
+  write_file /etc/ssh/sshd_config.d/10-qikehub.conf 0644 <<'EOF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin prohibit-password
+MaxAuthTries 3
+LoginGraceTime 20
+X11Forwarding no
+ClientAliveInterval 300
+ClientAliveCountMax 2
+EOF
+  if sshd -t; then
+    systemctl reload ssh.service 2>/dev/null || systemctl reload sshd.service 2>/dev/null || true
+    log "sshd: key-only"
+  else
+    rm -f /etc/ssh/sshd_config.d/10-qikehub.conf
+    warn "sshd -t failed — hardening drop-in removed"
+  fi
+}
+
+auto_updates() {
+  write_file /etc/apt/apt.conf.d/20auto-upgrades 0644 <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+  systemctl enable --now unattended-upgrades.service >/dev/null 2>&1 || true
+  log "unattended security upgrades enabled"
+}
+
+render_all() {
+  net_apply
+  wg_apply
+  fw_apply
+  if [[ $HARDEN_SSH == yes ]]; then harden_ssh; fi
+  if [[ $AUTO_UPDATES == yes ]]; then auto_updates; fi
+}
+
+# --- preflight / packages -------------------------------------------------------
+preflight() {
+  hdr "Preflight"
+  command -v systemctl >/dev/null || die "systemd required"
+  command -v apt-get >/dev/null || die "Debian/Ubuntu (apt) required"
+  if ! ip link add qikehubprobe type wireguard 2>/dev/null; then
+    modprobe wireguard 2>/dev/null || true
+    if ! ip link add qikehubprobe type wireguard 2>/dev/null; then
+      die "kernel lacks WireGuard support (needs Linux >= 5.6, or the wireguard-dkms package on an older kernel)"
+    fi
+  fi
+  ip link del qikehubprobe
+  log "kernel $(uname -r): WireGuard OK"
+}
+
+install_packages() {
+  hdr "Packages"
+  local -a pkgs=(wireguard-tools nftables qrencode iproute2 ca-certificates coreutils)
+  if [[ $AUTO_UPDATES == yes ]]; then pkgs+=(unattended-upgrades); fi
+  if ! dpkg -s chrony >/dev/null 2>&1; then pkgs+=(systemd-timesyncd); fi
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends "${pkgs[@]}" >/dev/null
+  log "installed: ${pkgs[*]}"
+}
+
+install_self() {
+  if [[ $HUB_SRC != "$HUB_OPT" ]]; then
+    install -d -m 0755 "$HUB_OPT"
+    install -m 0755 "$HUB_SRC/qikehub" "$HUB_OPT/qikehub"
+  fi
+  ln -sfn "$HUB_OPT/qikehub" /usr/local/sbin/qikehub
+}
+
+# --- usage / summary ------------------------------------------------------------
 usage() {
   cat <<EOF
-qikehub $HUB_VERSION — IKEv2/IPsec full-tunnel hub
+qikehub $HUB_VERSION — WireGuard hub (simplified)
 
 Usage: qikehub <command> [args]
 
   install | configure     interactive setup (re-run to change settings)
   render                  re-apply all generated config from $HUB_CONF
-  add-client NAME         issue a device identity + Apple/Android/swanctl profiles
-  revoke-client NAME      revoke via CRL and drop live SAs
-  list-clients            issued identities
+  add-client NAME         issue a device identity + .conf + QR code
+  revoke-client NAME      drop the peer immediately (live, no reload of others)
+  list-clients            issued identities + live handshake/transfer stats
   site-config             (re)issue home-site identity + RouterOS script
-  status                  services, SAs, pools, metrics
+  status                  interface, peers, firewall summary
   lockdown [--force]      remove public SSH bootstrap (run over the tunnel)
   allow-ssh CIDR[,CIDR]   re-open public SSH for given sources
-  snmp-rotate             new SNMPv3 credentials
   version | help
 
 Non-interactive: HUB_NONINTERACTIVE=1 with settings pre-set as env vars
-(see examples/hub.env.example).
-Progress messages are off by default (prompts/warnings/errors always show);
-set HUB_VERBOSE=1 for per-step confirmations.
+(see examples/qikehub.env.example).
+Progress messages are off by default; set HUB_VERBOSE=1 for per-step confirmations.
 EOF
-}
-
-install_self() {
-  if [[ $HUB_SRC != "$HUB_OPT" ]]; then
-    install -d -m 0755 "$HUB_OPT/lib"
-    install -m 0755 "$HUB_SRC/qikehub" "$HUB_OPT/qikehub"
-    install -m 0644 "$HUB_SRC"/lib/*.sh "$HUB_OPT/lib/"
-  fi
-  ln -sfn "$HUB_OPT/qikehub" /usr/local/sbin/qikehub
-}
-
-render_all() {
-  net_apply
-  pki_init
-  pki_ensure_server
-  swan_apply
-  conf_save            # PQ_ACTIVE may have changed
-  fw_apply
-  mon_apply
-  if [[ $HARDEN_SSH == yes ]]; then harden_ssh; fi
-  if [[ $AUTO_UPDATES == yes ]]; then auto_updates; fi
 }
 
 summary() {
   cat <<EOF
 
   FQDN / public IP   $HUB_FQDN / $PUBLIC_IP4 ($WAN_IF)
-  Public ports       UDP/$IKE_PORT$([[ $PORT_MODE == hybrid ]] && echo " + UDP/500, UDP/4500 (Apple native)")
-  Client pool        $POOL4, $POOL6 (IPv6: $IPV6_MODE)
-  Management         $MGMT4 (SSH$([[ $SNMP_ENABLED == yes ]] && echo ", SNMPv3")$([[ $NODE_EXPORTER == yes ]] && echo ", :9100")) — tunnel only
-  Client crypto      AES-256-GCM, SHA-384, ECP-384$([[ $PQ_MODE != off ]] && echo " + ML-KEM-1024 ($PQ_MODE)"), ECDSA P-384 certs
+  Public port        UDP/$WG_PORT
+  Client pool        $POOL4$([[ -n ${POOL6-} ]] && echo ", $POOL6") (IPv6: $IPV6_MODE)
+  Hub address        $(server_ip4) — reachable over the tunnel only
+  Client crypto      WireGuard: Curve25519, ChaCha20-Poly1305, BLAKE2s (fixed, not configurable)
   Egress             $EGRESS
-  Home site          $HOME_ENABLED$([[ $HOME_ENABLED == yes ]] && echo " — $HOME_NAME, LANs $HOME_LANS, auth $HOME_AUTH")
+  Home site          $HOME_ENABLED$([[ $HOME_ENABLED == yes ]] && echo " — $HOME_NAME, LANs $HOME_LANS")
   Client DNS         $CLIENT_DNS
   SSH bootstrap      ${SSH_BOOTSTRAP:-none}
 EOF
 }
 
+# --- commands --------------------------------------------------------------------
 cmd_install() {
   require_root
   hdr "qikehub $HUB_VERSION"
   preflight
 
-  # env presets win over stored state
   local -A preset=()
   local k
-  for k in "${HUB_KEYS[@]}"; do
-    if [[ -n ${!k-} ]]; then preset[$k]=${!k}; fi
-  done
+  for k in "${HUB_KEYS[@]}"; do [[ -n ${!k-} ]] && preset[$k]=${!k}; done
   conf_load || true
   for k in "${!preset[@]}"; do printf -v "$k" '%s' "${preset[$k]}"; done
 
@@ -97,81 +613,51 @@ cmd_install() {
   ask PUBLIC_IP4 "Public IPv4" "$(detect_public_ip4 "$WAN_IF")" is_ipv4
   ask HUB_FQDN "Hub FQDN (A record → $PUBLIC_IP4)" "" is_fqdn
   check_dns
-  ID_DOMAIN=${ID_DOMAIN:-$HUB_FQDN}
-
-  hdr "Ports"
-  cat <<'EOF'
-  custom : ONE non-standard UDP port. Works for strongSwan-based initiators
-           (Android app, Linux, macOS+Homebrew, RouterOS — verify, see README).
-  hybrid : custom port + UDP/500 (+4500 redirected). REQUIRED for the native
-           iOS/iPadOS/macOS IKEv2 client — Apple exposes no remote-port setting.
-EOF
-  ask_choice PORT_MODE "Port mode" hybrid "custom hybrid"
-  ask IKE_PORT "Published UDP port" "$(rand_port)" is_port
+  ask WG_PORT "Published UDP port" "$(rand_port)" is_port
 
   hdr "Addressing"
-  ask OVERLAY4 "Overlay /23 (1st /24 = clients, 2nd = mgmt)" 10.99.0.0/23 is_overlay23
-  derive_overlay
-  POOL6=${POOL6:-$(gen_ula_pool6)}
+  ask POOL4 "Client pool (/24)" 10.99.0.0/24 is_pool24
   if has_global_ip6 "$WAN_IF"; then
     ask_choice IPV6_MODE "Client IPv6: reject (leak-proof) or NAT66 via VPS" block "block nat66"
+    POOL6=${POOL6:-$(gen_ula_pool6)}
   else
-    IPV6_MODE=block
+    IPV6_MODE=block; POOL6=""
     log "no global IPv6 on $WAN_IF → client IPv6 captured and rejected"
   fi
 
-  hdr "Crypto"
-  ask_choice PQ_MODE "Hybrid PQ key exchange for clients (ECP-384 + ML-KEM-1024)" require "require prefer off"
-
   hdr "Home site & egress"
   ask_choice EGRESS "Client internet egress" vps "vps home"
-  if [[ $EGRESS == home ]]; then
-    HOME_ENABLED=yes
-  else
-    ask_choice HOME_ENABLED "Home site (initiates to the hub, e.g. RouterOS behind CGNAT)" yes "yes no"
-  fi
+  if [[ $EGRESS == home ]]; then HOME_ENABLED=yes; else ask_choice HOME_ENABLED "Home site (a router behind CGNAT, dialing out to the hub)" yes "yes no"; fi
   local def_dns="9.9.9.9,149.112.112.112"
   if [[ $HOME_ENABLED == yes ]]; then
     ask HOME_NAME "Site name" home-gw is_name
     ask HOME_LANS "Home LAN prefixes (comma separated)" 192.168.10.0/24 is_cidr4_list
     local lan
-    for lan in ${HOME_LANS//,/ }; do
-      if cidr4_overlap "$lan" "$OVERLAY4"; then die "$lan overlaps overlay $OVERLAY4"; fi
-    done
-    ask_choice HOME_AUTH "Site authentication" cert "cert psk"
+    for lan in ${HOME_LANS//,/ }; do cidr4_overlap "$lan" "$POOL4" && die "$lan overlaps pool $POOL4"; done
     if [[ $EGRESS == home ]]; then
       local first=${HOME_LANS%%,*}; def_dns=$(int2ip $(( $(ip2int "${first%/*}") + 1 )))
     fi
   else
-    HOME_LANS="" HOME_NAME=${HOME_NAME:-home-gw} HOME_AUTH=${HOME_AUTH:-cert}
+    HOME_LANS="" HOME_NAME=${HOME_NAME:-home-gw}
   fi
   ask CLIENT_DNS "DNS pushed to clients" "$def_dns" is_ipv4_list
-  ask_choice APPLE_ONDEMAND "Apple profiles always-on (OnDemand + IncludeAllNetworks, fail-closed)" yes "yes no"
 
   hdr "Management"
   local boot="" boot_dst=""
   if [[ -n ${SSH_CONNECTION-} ]]; then
     boot_dst=$(awk '{print $3}' <<<"$SSH_CONNECTION")
-    # only seed a default if we're actually on the public WAN address — a session
-    # over the mgmt tunnel must never auto-suggest reopening public SSH (that's
-    # what 'qikehub lockdown' closed)
     if [[ $boot_dst == "$PUBLIC_IP4" ]]; then
       boot=${SSH_CONNECTION%% *}
       if [[ $boot == *:* ]]; then boot="$boot/128"; else boot="$boot/32"; fi
     fi
   fi
-  # brand-new install (no prior hub.conf, no env preset — SSH_BOOTSTRAP truly unset,
-  # not just loaded as ""): keep public SSH reachable until 'qikehub lockdown' is run,
-  # from the detected client if we know it, else from anywhere. A reconfigure after
-  # lockdown must NOT reopen this — SSH_BOOTSTRAP already loaded as "" is left alone.
+  # brand-new install only (SSH_BOOTSTRAP truly unset): stay reachable until
+  # 'qikehub lockdown' runs, from the detected client if known, else anywhere.
+  # A reconfigure after lockdown must never reopen this on its own.
   if [[ -z ${SSH_BOOTSTRAP+x} ]]; then boot=${boot:-"0.0.0.0/0,::/0"}; fi
   ask SSH_BOOTSTRAP "Temporary public SSH sources ('-' = none)" "$boot" is_src_list
-  ask_choice SNMP_ENABLED "SNMPv3 agent on $MGMT4" yes "yes no"
-  if [[ $SNMP_ENABLED == yes ]]; then ask SNMP_USER "SNMPv3 user" monitor is_name; fi
-  ask_choice NODE_EXPORTER "Prometheus node_exporter + IPsec metrics on $MGMT4:9100" yes "yes no"
   ask_choice HARDEN_SSH "Harden sshd (key-only)" yes "yes no"
   ask_choice AUTO_UPDATES "Unattended security upgrades" yes "yes no"
-  PQ_ACTIVE=${PQ_ACTIVE:-off}
 
   hdr "Summary"
   summary
@@ -187,9 +673,9 @@ EOF
   Next:
     qikehub add-client luca-iphone      # → $HUB_OUT/luca-iphone/
 $([[ $HOME_ENABLED == yes ]] && echo "    qikehub site-config                 # → RouterOS script + identity")
-    ssh <user>@$MGMT4                    # over the tunnel, then:
+    ssh <user>@$(server_ip4)             # over the tunnel, then:
     qikehub lockdown                    # closes public SSH
-  Provider firewall: allow only UDP/$IKE_PORT$([[ $PORT_MODE == hybrid ]] && echo ", UDP/500, UDP/4500") (+ TCP/22 until lockdown).
+  Provider firewall: allow only UDP/$WG_PORT (+ TCP/22 until lockdown).
 EOF
 }
 
@@ -200,85 +686,85 @@ cmd_add_client() {
   local name=${1-}
   if [[ -z $name ]]; then ask name "Client name (e.g. luca-iphone)" "" is_name; fi
   is_name "$name" || die "invalid name '$name' (a-z0-9-, 2-32 chars)"
-  [[ -z $(pki_index_valid client "$name") ]] || die "client '$name' already exists — revoke it first"
+  [[ -z $(peer_row "$name") ]] || die "client '$name' already exists — revoke it first"
 
-  local id="$name@$ID_DOMAIN" dir="$HUB_OUT/$name" pass
+  local dir="$HUB_OUT/$name" priv pub ip4 ip6
   install -d -m 0700 "$HUB_VAR" "$HUB_OUT"
   rm -rf "$dir"; install -d -m 0700 "$dir"
 
-  pki_issue_entity client "$name" "$id"
-  pass=$(gen_secret 24)
-  export HUB_P12_PASS=$pass
-  pki_export_p12 "$PKI_KEY" "$PKI_CERT" "$id" "$dir/$name.p12"
-  unset HUB_P12_PASS
-  pki_destroy_key "$PKI_KEY"
+  priv=$(wg_genkey); pub=$(wg_pubkey "$priv")
+  ip4=$(peer_next_ip4); ip6=$(peer_next_ip6)
+  printf '%s\t%s\t%s\t%s\n' "$name" "$ip4" "$ip6" "$pub" >> "$HUB_PEERS"
+  ( umask 077; printf '%s' "$priv" > "$HUB_ETC/client-$name.key" )
 
-  install -m 0644 "$HUB_PKI/certs/ca.pem" "$dir/qikehub-ca.pem"
-  install -m 0644 "$PKI_CERT" "$dir/$name.pem"
-  profile_apple "$name" "$id" "$dir/$name.p12" > "$dir/$name.mobileconfig"
-  profile_sswan "$name" "$id" "$dir/$name.p12" > "$dir/$name.sswan"
-  profile_swanctl "$name" "$id" > "$dir/$name-swanctl.conf"
-  chmod 0600 "$dir"/*
+  render_client_conf "$name" > "$dir/$name.conf"
+  chmod 0600 "$dir/$name.conf"
+  shred -u "$HUB_ETC/client-$name.key" 2>/dev/null || rm -f "$HUB_ETC/client-$name.key"
+
+  wg_apply   # live peer add — does not touch nftables, does not affect other peers
+
+  local qr=1
+  command -v qrencode >/dev/null || qr=0
+  if (( qr )); then qrencode -t png -o "$dir/$name.png" < "$dir/$name.conf"; fi
 
   hdr "Client $name"
   cat <<EOF
-  Identity        $id
-  PKCS#12 pass    ${C_B}$pass${C_0}   (shown once — not stored)
-  Files           $dir/
-    $name.mobileconfig   iOS/iPadOS/macOS native$([[ $PORT_MODE == custom ]] && echo "  ${C_Y}(needs PORT_MODE=hybrid)${C_0}")
-    $name.sswan          strongSwan Android app (custom port)
-    $name-swanctl.conf   Linux / macOS Homebrew strongSwan (custom port)
-    $name.p12, $name.pem, qikehub-ca.pem
-  Copy off the box (e.g. scp root@$MGMT4:$dir/$name.mobileconfig .), install,
+  Address         $ip4$([[ -n $ip6 ]] && echo ", $ip6")
+  Files           $dir/$name.conf$((qr)) 2>/dev/null; $([[ -f $dir/$name.png ]] && echo "$dir/$name.png (QR)")
+  Import in the WireGuard app, or scan the QR code below:
+EOF
+  if (( qr )) && [[ -t 1 ]]; then qrencode -t ansiutf8 < "$dir/$name.conf"; fi
+  cat <<EOF
+  Copy off the box (e.g. scp root@$(server_ip4):$dir/$name.conf .), install,
   then: rm -rf $dir
 EOF
 }
 
 cmd_revoke_client() {
   require_root; conf_load || die "not installed"
-  local name=${1-} id
+  local name=${1-} row pub
   is_name "$name" || die "usage: qikehub revoke-client NAME"
-  id=$(pki_revoke_entity client "$name" key-compromise) || die "no valid client '$name'"
-  swan_install_creds
-  swan_load
-  swan_terminate_id "$id"
+  row=$(peer_row "$name"); [[ -n $row ]] || die "no such client '$name'"
+  pub=$(cut -f4 <<<"$row")
+  grep -v -F -x "$row" "$HUB_PEERS" > "$HUB_PEERS.tmp" || true
+  mv -f "$HUB_PEERS.tmp" "$HUB_PEERS"
+  wg set "$WG_IF" peer "$pub" remove 2>/dev/null || true
+  wg_apply
   rm -rf "${HUB_OUT:?}/$name"
-  log "revoked $id (CRL updated, SAs terminated)"
+  log "revoked $name (peer removed live)"
 }
 
 cmd_list_clients() {
   require_root; conf_load || die "not installed"
-  printf '%-8s %-20s %-40s %-26s %s\n' TYPE NAME ID NOT_AFTER STATUS
-  awk -F'\t' '{printf "%-8s %-20s %-40s %-26s %s\n", $1, $2, $3, $5, $6}' "$HUB_PKI/index.tsv"
+  printf '%-20s %-18s %-45s %-12s %s\n' NAME IP PUBKEY LATEST-HS TRANSFER
+  [[ -f $HUB_PEERS ]] || return 0
+  local name ip4 ip6 pub line lasths rx tx
+  while IFS=$'\t' read -r name ip4 ip6 pub; do
+    line=$(wg show "$WG_IF" dump 2>/dev/null | awk -v p="$pub" '$1==p') || true
+    lasths=U; rx=0; tx=0
+    if [[ -n $line ]]; then
+      lasths=$(cut -f5 <<<"$line"); rx=$(cut -f6 <<<"$line"); tx=$(cut -f7 <<<"$line")
+      [[ $lasths == 0 ]] && lasths=never || lasths=$(( ($(date +%s) - lasths) / 60 ))m-ago
+    fi
+    printf '%-20s %-18s %-45s %-12s %s/%s\n' "$name" "$ip4" "$pub" "$lasths" "$rx" "$tx"
+  done < "$HUB_PEERS"
 }
 
 cmd_site_config() {
   require_root; conf_load || die "not installed"
   [[ $HOME_ENABLED == yes ]] || die "home site disabled — run 'qikehub configure'"
-  local dir="$HUB_OUT/site-$HOME_NAME" id pass=""
-  id=$(site_id)
+  local dir="$HUB_OUT/site-$HOME_NAME" priv pub
   rm -rf "$dir"; install -d -m 0700 "$HUB_OUT" "$dir"
-  if [[ $HOME_AUTH == cert ]]; then
-    if [[ -n $(pki_index_valid site "$HOME_NAME") ]]; then
-      pki_revoke_entity site "$HOME_NAME" superseded >/dev/null
-      swan_install_creds; swan_load; swan_terminate_id "$id"
-    fi
-    pki_issue_entity site "$HOME_NAME" "$id"
-    pass=$(gen_secret 24)
-    export HUB_P12_PASS=$pass
-    pki_export_p12 "$PKI_KEY" "$PKI_CERT" "$id" "$dir/$HOME_NAME.p12"
-    unset HUB_P12_PASS
-    pki_destroy_key "$PKI_KEY"
-    install -m 0600 "$HUB_PKI/certs/ca.pem" "$dir/qikehub-ca.pem"
-  fi
-  profile_routeros > "$dir/$HOME_NAME.rsc"
+  priv=$(wg_genkey); pub=$(wg_pubkey "$priv")
+  printf '%s' "$pub" > "$HUB_ETC/site-$HOME_NAME.pub"
+  render_site_rsc "$priv" > "$dir/$HOME_NAME.rsc"
   chmod 0600 "$dir"/*
+  wg_apply
+
   hdr "Site $HOME_NAME"
   cat <<EOF
-  Identity        fqdn:$id → hub fqdn:$HUB_FQDN, UDP/$IKE_PORT
-$([[ -n $pass ]] && echo "  PKCS#12 pass    ${C_B}$pass${C_0}   (shown once)")
-  Files           $dir/
-  RouterOS script $HOME_NAME.rsc  (read the header before importing)
+  Files           $dir/$HOME_NAME.rsc  (contains the site's private key — read
+                  the header, then delete it from the router after import)
 EOF
 }
 
@@ -286,14 +772,11 @@ cmd_status() {
   require_root; conf_load || die "not installed"
   hdr "Services"
   local u
-  for u in qikehub-net "$SWAN_UNIT" nftables qikehub-metrics.timer snmpd prometheus-node-exporter; do
-    printf '  %-28s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null || true)"
+  for u in qikehub-net qikehub-wg nftables; do
+    printf '  %-18s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null || true)"
   done
-  hdr "Tunnels"
-  "$HUB_LIBEXEC/collect-metrics.sh" || true
-  for u in "${MON_KEYS[@]}"; do printf '  %-18s %s\n' "$u" "$(cat "/run/qikehub/snmp/$u" 2>/dev/null || echo U)"; done
-  hdr "SAs"
-  swanctl --list-sas 2>/dev/null | sed 's/^/  /' || true
+  hdr "WireGuard"
+  wg show "$WG_IF" 2>/dev/null | sed 's/^/  /' || warn "interface not up"
   hdr "Config"
   summary
 }
@@ -302,12 +785,12 @@ cmd_lockdown() {
   require_root; conf_load || die "not installed"
   if [[ -n ${SSH_CONNECTION-} && ${1-} != --force ]]; then
     local dst; dst=$(awk '{print $3}' <<<"$SSH_CONNECTION")
-    [[ $dst == "$MGMT4" ]] || die "you are on $dst, not $MGMT4 — reconnect over the tunnel (or --force)"
+    [[ $dst == "$(server_ip4)" ]] || die "you are on $dst, not $(server_ip4) — reconnect over the tunnel (or --force)"
   fi
   SSH_BOOTSTRAP=""
   conf_save
   fw_apply
-  log "public SSH closed; management only via $MGMT4"
+  log "public SSH closed; management only via $(server_ip4)"
 }
 
 cmd_allow_ssh() {
@@ -316,14 +799,6 @@ cmd_allow_ssh() {
   SSH_BOOTSTRAP=$1
   conf_save
   fw_apply
-}
-
-cmd_snmp_rotate() {
-  require_root; conf_load || die "not installed"
-  [[ $SNMP_ENABLED == yes ]] || die "SNMP disabled"
-  snmp_create_user
-  systemctl start snmpd.service
-  cat "$HUB_SECRETS/snmp.env"
 }
 
 main() {
@@ -339,7 +814,6 @@ main() {
     status)            cmd_status ;;
     lockdown)          cmd_lockdown "$@" ;;
     allow-ssh)         cmd_allow_ssh "$@" ;;
-    snmp-rotate)       cmd_snmp_rotate ;;
     version)           echo "$HUB_VERSION" ;;
     help|-h|--help)    usage ;;
     *)                 usage; exit 2 ;;
